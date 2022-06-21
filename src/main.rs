@@ -1,7 +1,8 @@
 use ash::extensions::khr;
-use ash::vk::{self, SurfaceFormatKHR};
+use ash::vk;
 use std::ffi::*;
-use std::mem::drop;
+use std::mem::ManuallyDrop;
+use winit::event::{Event, WindowEvent};
 // use ash::vk::EntryFnV1_3;
 // use ash::vk::DeviceFnV1_3;
 // use ash::vk::InstanceFnV1_3;
@@ -13,39 +14,93 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_inner_size(winit::dpi::LogicalSize::new(1024.0, 1024.0))
         .build(&event_loop)
         .unwrap();
-
-    // Loads the vulkan library and unwraps the result((?))-, erroring if it fails and ending the program
-    let entry = unsafe { ash::Entry::load()? };
-    let layer_names = vec![CString::new("VK_LAYER_KHRONOS_validation").unwrap()];
-    let instance = init_instance(&entry, &layer_names)?;
-    let debug = DebugSt::init(&entry, &instance)?;
-
-    // Create our window surface and surface loader (an entry to surface-related functions)
-    let surfaces = SurfaceSt::init(&window, &entry, &instance)?;
-    let (physical_device, physical_device_properties) =
-        init_physical_device_and_properties(&instance)?;
-    let queue_families = QueueFamilies::init(&instance, physical_device, &surfaces)?;
-    let (logical_device, queues) =
-        init_device_and_queues(&instance, physical_device, &queue_families, &layer_names)?;
-
-    let swapchain = SwapchainSt::init(
-        &instance,
-        physical_device,
-        &logical_device,
-        &surfaces,
-        &queue_families,
-        &queues,
-    )?;
-
-    // Cleanup Vulkan objects we created before exiting the application
-    unsafe {
-        swapchain.cleanup(&logical_device);
-        logical_device.destroy_device(None);
-        drop(surfaces);
-        drop(debug);
-        instance.destroy_instance(None);
-    };
+    let vulkanloader = VulkanSt::init(window)?;
+    event_loop.run(move |event, _, controlflow| match event {
+        Event::WindowEvent {
+            event: WindowEvent::CloseRequested,
+            ..
+        } => {
+            *controlflow = winit::event_loop::ControlFlow::Exit;
+        }
+        _ => {
+            // do work here later
+            vulkanloader.window.request_redraw();
+        }
+        Event::RedrawRequested(_) => {
+            // render here later
+        }
+    });
     Ok(())
+}
+
+struct VulkanSt {
+    window: winit::window::Window,
+    entry: ash::Entry,
+    instance: ash::Instance,
+    debug: ManuallyDrop<DebugSt>,
+    surfaces: ManuallyDrop<SurfaceSt>,
+    physical_device: vk::PhysicalDevice,
+    physical_device_properties: vk::PhysicalDeviceProperties,
+    queue_families: QueueFamilies,
+    queues: Queues,
+    device: ash::Device,
+    swapchain: SwapchainSt,
+}
+
+impl VulkanSt {
+    fn init(window: winit::window::Window) -> Result<VulkanSt, Box<dyn std::error::Error>> {
+        // Loads the vulkan library and unwraps the result((?))-, erroring if it fails and ending the program
+        let entry = unsafe { ash::Entry::load()? };
+
+        let layer_names = vec![CString::new("VK_LAYER_KHRONOS_validation").unwrap()];
+        let instance = init_instance(&entry, &layer_names)?;
+        let debug = DebugSt::init(&entry, &instance)?;
+        // Create our window surface and surface loader (an entry to surface-related functions)
+        let surfaces = SurfaceSt::init(&window, &entry, &instance)?;
+
+        let (physical_device, physical_device_properties) =
+            init_physical_device_and_properties(&instance)?;
+
+        let queue_families = QueueFamilies::init(&instance, physical_device, &surfaces)?;
+
+        let (logical_device, queues) =
+            init_device_and_queues(&instance, physical_device, &queue_families, &layer_names)?;
+
+        let swapchain = SwapchainSt::init(
+            &instance,
+            physical_device,
+            &logical_device,
+            &surfaces,
+            &queue_families,
+            &queues,
+        )?;
+        Ok(VulkanSt {
+            window,
+            entry,
+            instance,
+            debug: ManuallyDrop::new(debug),
+            surfaces: ManuallyDrop::new(surfaces),
+            physical_device,
+            physical_device_properties,
+            queue_families,
+            queues,
+            device: logical_device,
+            swapchain,
+        })
+    }
+}
+
+// TODO: Get rid of all the ManuallyDrop::drop garbage
+impl Drop for VulkanSt {
+    fn drop(&mut self) {
+        unsafe {
+            self.swapchain.cleanup(&self.device);
+            self.device.destroy_device(None);
+            std::mem::ManuallyDrop::drop(&mut self.surfaces);
+            std::mem::ManuallyDrop::drop(&mut self.debug);
+            self.instance.destroy_instance(None);
+        };
+    }
 }
 
 fn layer_names_as_ptrs(layer_names: &Vec<CString>) -> Vec<*const i8> {
@@ -307,18 +362,12 @@ impl SwapchainSt {
             imageviews: swapchain_imageviews,
         })
     }
-    unsafe fn cleanup(self, logical_device: &ash::Device) {
+    unsafe fn cleanup(&mut self, logical_device: &ash::Device) {
         for iv in &self.imageviews {
             logical_device.destroy_image_view(*iv, None);
         }
-    }
-}
-impl Drop for SwapchainSt {
-    fn drop(&mut self) {
-        unsafe {
-            self.swapchain_loader
-                .destroy_swapchain(self.swapchain, None);
-        }
+        self.swapchain_loader
+            .destroy_swapchain(self.swapchain, None);
     }
 }
 
