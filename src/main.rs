@@ -1,11 +1,11 @@
+// #![allow(dead_code)]
+// #![allow(unused_variables)]
+// #![allow(unreachable_code)]
 use ash::extensions::khr;
 use ash::vk;
 use std::ffi::*;
 use std::mem::ManuallyDrop;
 use winit::event::{Event, WindowEvent};
-// use ash::vk::EntryFnV1_3;
-// use ash::vk::DeviceFnV1_3;
-// use ash::vk::InstanceFnV1_3;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let event_loop = winit::event_loop::EventLoop::new();
@@ -22,13 +22,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             *controlflow = winit::event_loop::ControlFlow::Exit;
         }
-        _ => {
+        Event::MainEventsCleared => {
             // do work here later
             vulkanloader.window.request_redraw();
         }
         Event::RedrawRequested(_) => {
             // render here later
         }
+        _ => {}
     });
     Ok(())
 }
@@ -67,7 +68,7 @@ impl VulkanSt {
         let (logical_device, queues) =
             init_device_and_queues(&instance, physical_device, &queue_families, &layer_names)?;
 
-        let swapchain = SwapchainSt::init(
+        let mut swapchain = SwapchainSt::init(
             &instance,
             physical_device,
             &logical_device,
@@ -76,8 +77,105 @@ impl VulkanSt {
             &queues,
         )?;
 
-        let renderpass = init_renderpass(&logical_device, physical_device, &surfaces)?;
+        let renderpass = init_renderpass(
+            &logical_device,
+            physical_device,
+            swapchain.surface_format.format,
+        )?;
+        swapchain.create_framebuffers(&logical_device, renderpass)?;
 
+        let vertexshader_create_info = vk::ShaderModuleCreateInfo::builder()
+            .code(vk_shader_macros::include_glsl!("./shaders/shader.vert"));
+        let vertexshader_module =
+            unsafe { logical_device.create_shader_module(&vertexshader_create_info, None)? };
+
+        let fragmentshader_create_info = vk::ShaderModuleCreateInfo::builder()
+            .code(vk_shader_macros::include_glsl!("./shaders/shader.frag"));
+        let fragmentshader_module =
+            unsafe { logical_device.create_shader_module(&fragmentshader_create_info, None)? };
+
+        let mainfunctionname = CString::new("main").unwrap();
+        let vertexshader_stage = vk::PipelineShaderStageCreateInfo::builder()
+            .stage(vk::ShaderStageFlags::VERTEX)
+            .module(vertexshader_module)
+            .name(&mainfunctionname);
+        let fragmentshader_stage = vk::PipelineShaderStageCreateInfo::builder()
+            .stage(vk::ShaderStageFlags::FRAGMENT)
+            .module(fragmentshader_module)
+            .name(&mainfunctionname);
+        let shader_stages = vec![vertexshader_stage.build(), fragmentshader_stage.build()];
+        let vertex_input_info = vk::PipelineVertexInputStateCreateInfo::builder();
+        let input_assembly_info = vk::PipelineInputAssemblyStateCreateInfo::builder()
+            .topology(vk::PrimitiveTopology::POINT_LIST);
+
+        let viewports = [vk::Viewport {
+            x: 0.,
+            y: 0.,
+            width: swapchain.extent.width as f32,
+            height: swapchain.extent.height as f32,
+            min_depth: 0.,
+            max_depth: 1.,
+        }];
+
+        let scissors = [vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent: swapchain.extent,
+        }];
+
+        let viewport_info = vk::PipelineViewportStateCreateInfo::builder()
+            .viewports(&viewports)
+            .scissors(&scissors);
+
+        let rasterizer_info = vk::PipelineRasterizationStateCreateInfo::builder()
+            .line_width(1.0)
+            .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+            .cull_mode(vk::CullModeFlags::NONE)
+            .polygon_mode(vk::PolygonMode::FILL);
+
+        let multisample_info = vk::PipelineMultisampleStateCreateInfo::builder()
+            .rasterization_samples(vk::SampleCountFlags::TYPE_1); // 1spp
+
+        let colorblend_attachments = [vk::PipelineColorBlendAttachmentState::builder()
+            .blend_enable(true)
+            .src_color_blend_factor(vk::BlendFactor::SRC1_ALPHA)
+            .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+            .color_blend_op(vk::BlendOp::ADD)
+            .src_alpha_blend_factor(vk::BlendFactor::SRC1_ALPHA)
+            .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+            .color_write_mask(
+                vk::ColorComponentFlags::R
+                    | vk::ColorComponentFlags::G
+                    | vk::ColorComponentFlags::B
+                    | vk::ColorComponentFlags::A,
+            )
+            .build()];
+        let colorblend_info =
+            vk::PipelineColorBlendStateCreateInfo::builder().attachments(&colorblend_attachments);
+
+        let pipelinelayout_info = vk::PipelineLayoutCreateInfo::builder();
+        let pipelinelayout =
+            unsafe { logical_device.create_pipeline_layout(&pipelinelayout_info, None)? };
+
+        let pipeline_info = vk::GraphicsPipelineCreateInfo::builder()
+            .stages(&shader_stages)
+            .vertex_input_state(&vertex_input_info)
+            .input_assembly_state(&input_assembly_info)
+            .viewport_state(&viewport_info)
+            .rasterization_state(&rasterizer_info)
+            .multisample_state(&multisample_info)
+            .color_blend_state(&colorblend_info)
+            .layout(pipelinelayout)
+            .render_pass(renderpass)
+            .subpass(0);
+        let graphics_pipeline = unsafe {
+            logical_device
+                .create_graphics_pipelines(
+                    vk::PipelineCache::null(),
+                    &[pipeline_info.build()],
+                    None,
+                )
+                .expect("Pipeline Creation Error")
+        }[0];
         Ok(VulkanSt {
             window,
             entry,
@@ -164,7 +262,7 @@ struct DebugSt {
 }
 impl DebugSt {
     fn init(entry: &ash::Entry, instance: &ash::Instance) -> Result<DebugSt, vk::Result> {
-        let mut debug_create_info = vk::DebugUtilsMessengerCreateInfoEXT::builder()
+        let debug_create_info = vk::DebugUtilsMessengerCreateInfoEXT::builder()
             .message_severity(
                 vk::DebugUtilsMessageSeverityFlagsEXT::WARNING
         // | vk::DebugUtilsMessageSeverityFlagsEXT::VERBOSE
@@ -310,6 +408,9 @@ struct SwapchainSt {
     swapchain: vk::SwapchainKHR,
     images: Vec<vk::Image>,
     imageviews: Vec<vk::ImageView>,
+    framebuffers: Vec<vk::Framebuffer>,
+    surface_format: vk::SurfaceFormatKHR,
+    extent: vk::Extent2D,
 }
 
 impl SwapchainSt {
@@ -322,8 +423,9 @@ impl SwapchainSt {
         queues: &Queues,
     ) -> Result<SwapchainSt, vk::Result> {
         let surface_capabilities = surfaces.get_capabilities(physical_device)?;
+        let extent = surface_capabilities.current_extent;
         let surface_present_modes = surfaces.get_present_modes(physical_device)?;
-        let surface_formats = surfaces.get_formats(physical_device)?;
+        let surface_format = *surfaces.get_formats(physical_device)?.first().unwrap();
         let queuefamilies = [queue_families.graphics_q_index.unwrap()];
         let swapchain_create_info = vk::SwapchainCreateInfoKHR::builder()
             .surface(surfaces.surface)
@@ -331,8 +433,8 @@ impl SwapchainSt {
                 3.max(surface_capabilities.min_image_count)
                     .min(surface_capabilities.max_image_count),
             )
-            .image_format(surface_formats.first().unwrap().format)
-            .image_color_space(surface_formats.first().unwrap().color_space)
+            .image_format(surface_format.format)
+            .image_color_space(surface_format.color_space)
             .image_extent(surface_capabilities.current_extent)
             .image_array_layers(1)
             .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
@@ -366,9 +468,31 @@ impl SwapchainSt {
             swapchain,
             images: swapchain_images,
             imageviews: swapchain_imageviews,
+            framebuffers: vec![],
+            surface_format,
+            extent,
         })
     }
+    fn create_framebuffers(
+        &mut self,
+        logical_device: &ash::Device,
+        renderpass: vk::RenderPass,
+    ) -> Result<(), vk::Result> {
+        for iv in &self.imageviews {
+            let iview = [*iv];
+            let framebuffer_info = vk::FramebufferCreateInfo::builder()
+                .render_pass(renderpass)
+                .attachments(&iview)
+                .width(self.extent.width)
+                .height(self.extent.height)
+                .layers(1);
+        }
+        Ok(())
+    }
     unsafe fn cleanup(&mut self, logical_device: &ash::Device) {
+        for fb in &self.framebuffers {
+            logical_device.destroy_framebuffer(*fb, None);
+        }
         for iv in &self.imageviews {
             logical_device.destroy_image_view(*iv, None);
         }
@@ -447,16 +571,10 @@ fn init_physical_device_and_properties(
 fn init_renderpass(
     logical_device: &ash::Device,
     physical_device: vk::PhysicalDevice,
-    surfaces: &SurfaceSt,
+    format: vk::Format,
 ) -> Result<vk::RenderPass, vk::Result> {
     let attachments = [vk::AttachmentDescription::builder()
-        .format(
-            surfaces
-                .get_formats(physical_device)?
-                .first()
-                .unwrap()
-                .format,
-        )
+        .format(format)
         .load_op(vk::AttachmentLoadOp::CLEAR)
         .store_op(vk::AttachmentStoreOp::STORE)
         .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
