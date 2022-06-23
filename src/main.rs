@@ -34,92 +34,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-struct VulkanSt {
-    window: winit::window::Window,
-    entry: ash::Entry,
-    instance: ash::Instance,
-    debug: ManuallyDrop<DebugSt>,
-    surfaces: ManuallyDrop<SurfaceSt>,
-    physical_device: vk::PhysicalDevice,
-    physical_device_properties: vk::PhysicalDeviceProperties,
-    queue_families: QueueFamilies,
-    queues: Queues,
-    device: ash::Device,
-    swapchain: SwapchainSt,
-    renderpass: vk::RenderPass,
-    pipeline: PipelineSt,
-}
-
-impl VulkanSt {
-    fn init(window: winit::window::Window) -> Result<VulkanSt, Box<dyn std::error::Error>> {
-        // Loads the vulkan library and unwraps the result((?))-, erroring if it fails and ending the program
-        let entry = unsafe { ash::Entry::load()? };
-
-        let layer_names = vec![CString::new("VK_LAYER_KHRONOS_validation").unwrap()];
-        let instance = init_instance(&entry, &layer_names)?;
-        let debug = DebugSt::init(&entry, &instance)?;
-        // Create our window surface and surface loader (an entry to surface-related functions)
-        let surfaces = SurfaceSt::init(&window, &entry, &instance)?;
-
-        let (physical_device, physical_device_properties) =
-            init_physical_device_and_properties(&instance)?;
-
-        let queue_families = QueueFamilies::init(&instance, physical_device, &surfaces)?;
-
-        let (logical_device, queues) =
-            init_device_and_queues(&instance, physical_device, &queue_families, &layer_names)?;
-
-        let mut swapchain = SwapchainSt::init(
-            &instance,
-            physical_device,
-            &logical_device,
-            &surfaces,
-            &queue_families,
-            &queues,
-        )?;
-
-        let renderpass = init_renderpass(
-            &logical_device,
-            physical_device,
-            swapchain.surface_format.format,
-        )?;
-        swapchain.create_framebuffers(&logical_device, renderpass)?;
-
-        let pipeline = PipelineSt::init(&logical_device, &swapchain, &renderpass)?;
-
-        Ok(VulkanSt {
-            window,
-            entry,
-            instance,
-            debug: ManuallyDrop::new(debug),
-            surfaces: ManuallyDrop::new(surfaces),
-            physical_device,
-            physical_device_properties,
-            queue_families,
-            queues,
-            device: logical_device,
-            swapchain,
-            renderpass,
-            pipeline,
-        })
-    }
-}
-
-// TODO: Get rid of all the ManuallyDrop::drop garbage
-impl Drop for VulkanSt {
-    fn drop(&mut self) {
-        unsafe {
-            self.pipeline.cleanup(&self.device);
-            self.device.destroy_render_pass(self.renderpass, None);
-            self.swapchain.cleanup(&self.device);
-            self.device.destroy_device(None);
-            std::mem::ManuallyDrop::drop(&mut self.surfaces);
-            std::mem::ManuallyDrop::drop(&mut self.debug);
-            self.instance.destroy_instance(None);
-        };
-    }
-}
-
 fn layer_names_as_ptrs(layer_names: &Vec<CString>) -> Vec<*const i8> {
     layer_names.iter().map(|layers| layers.as_ptr()).collect()
 }
@@ -324,6 +238,11 @@ struct SwapchainSt {
     framebuffers: Vec<vk::Framebuffer>,
     surface_format: vk::SurfaceFormatKHR,
     extent: vk::Extent2D,
+    image_available: Vec<vk::Semaphore>,
+    rendering_finished: Vec<vk::Semaphore>,
+    may_begin_drawing: Vec<vk::Fence>,
+    amount_of_images: u32,
+    current_image: usize,
 }
 
 impl SwapchainSt {
@@ -359,6 +278,7 @@ impl SwapchainSt {
         let swapchain_loader = ash::extensions::khr::Swapchain::new(instance, logical_device);
         let swapchain = unsafe { swapchain_loader.create_swapchain(&swapchain_create_info, None)? };
         let swapchain_images = unsafe { swapchain_loader.get_swapchain_images(swapchain)? };
+        let amount_of_images = swapchain_images.len() as u32;
         let mut swapchain_imageviews = Vec::with_capacity(swapchain_images.len());
         for image in &swapchain_images {
             let subresource_range = vk::ImageSubresourceRange::builder()
@@ -376,6 +296,21 @@ impl SwapchainSt {
                 unsafe { logical_device.create_image_view(&imageview_create_info, None) }?;
             swapchain_imageviews.push(imageview);
         }
+        let mut image_available = vec![];
+        let mut rendering_finished = vec![];
+        let mut may_begin_drawing = vec![];
+        let semaphoreinfo = vk::SemaphoreCreateInfo::builder();
+        let fenceinfo = vk::FenceCreateInfo::builder().flags(vk::FenceCreateFlags::SIGNALED);
+        for _ in 0..amount_of_images {
+            let semaphore_available =
+                unsafe { logical_device.create_semaphore(&semaphoreinfo, None) }?;
+            let semaphore_finished =
+                unsafe { logical_device.create_semaphore(&semaphoreinfo, None) }?;
+            image_available.push(semaphore_available);
+            rendering_finished.push(semaphore_finished);
+            let fence = unsafe { logical_device.create_fence(&fenceinfo, None) }?;
+            may_begin_drawing.push(fence);
+        }
         Ok(SwapchainSt {
             swapchain_loader,
             swapchain,
@@ -384,6 +319,11 @@ impl SwapchainSt {
             framebuffers: vec![],
             surface_format,
             extent,
+            image_available,
+            rendering_finished,
+            may_begin_drawing,
+            amount_of_images,
+            current_image: 0,
         })
     }
     fn create_framebuffers(
@@ -399,10 +339,21 @@ impl SwapchainSt {
                 .width(self.extent.width)
                 .height(self.extent.height)
                 .layers(1);
+            let fb = unsafe { logical_device.create_framebuffer(&framebuffer_info, None) }?;
+            self.framebuffers.push(fb);
         }
         Ok(())
     }
     unsafe fn cleanup(&mut self, logical_device: &ash::Device) {
+        for fence in &self.may_begin_drawing {
+            logical_device.destroy_fence(*fence, None);
+        }
+        for semaphore in &self.image_available {
+            logical_device.destroy_semaphore(*semaphore, None);
+        }
+        for semaphore in &self.rendering_finished {
+            logical_device.destroy_semaphore(*semaphore, None);
+        }
         for fb in &self.framebuffers {
             logical_device.destroy_framebuffer(*fb, None);
         }
@@ -645,11 +596,204 @@ impl PipelineSt {
     }
 }
 
+struct PoolsSt {
+    commandpool_graphics: vk::CommandPool,
+    commandpool_transfer: vk::CommandPool,
+}
+
+impl PoolsSt {
+    fn init(
+        logical_device: &ash::Device,
+        queue_families: &QueueFamilies,
+    ) -> Result<PoolsSt, vk::Result> {
+        let graphics_commandpool_info = vk::CommandPoolCreateInfo::builder()
+            .queue_family_index(queue_families.graphics_q_index.unwrap())
+            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER); // We can reuse the command buffers
+        let commandpool_graphics =
+            unsafe { logical_device.create_command_pool(&graphics_commandpool_info, None)? };
+        let transfer_commandpool_info = vk::CommandPoolCreateInfo::builder()
+            .queue_family_index(queue_families.transfer_q_index.unwrap())
+            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+        let commandpool_transfer =
+            unsafe { logical_device.create_command_pool(&transfer_commandpool_info, None)? };
+
+        Ok(PoolsSt {
+            commandpool_graphics,
+            commandpool_transfer,
+        })
+    }
+    fn cleanup(&self, logical_device: &ash::Device) {
+        unsafe {
+            logical_device.destroy_command_pool(self.commandpool_graphics, None);
+            logical_device.destroy_command_pool(self.commandpool_transfer, None);
+        }
+    }
+}
+struct VulkanSt {
+    window: winit::window::Window,
+    entry: ash::Entry,
+    instance: ash::Instance,
+    debug: ManuallyDrop<DebugSt>,
+    surfaces: ManuallyDrop<SurfaceSt>,
+    physical_device: vk::PhysicalDevice,
+    physical_device_properties: vk::PhysicalDeviceProperties,
+    queue_families: QueueFamilies,
+    queues: Queues,
+    device: ash::Device,
+    swapchain: SwapchainSt,
+    renderpass: vk::RenderPass,
+    pipeline: PipelineSt,
+    pools: PoolsSt,
+    commandbuffers: Vec<vk::CommandBuffer>,
+}
+
+fn create_commandbuffers(
+    logical_device: &ash::Device,
+    pools: &PoolsSt,
+    amount: usize,
+) -> Result<Vec<vk::CommandBuffer>, vk::Result> {
+    let commandbuffer_allocate_info = vk::CommandBufferAllocateInfo::builder()
+        .command_pool(pools.commandpool_graphics)
+        .command_buffer_count(amount as u32);
+    unsafe { logical_device.allocate_command_buffers(&commandbuffer_allocate_info) }
+}
+
+fn fill_commandbuffers(
+    commandbuffers: &[vk::CommandBuffer],
+    logical_device: &ash::Device,
+    renderpass: &vk::RenderPass,
+    swapchain: &SwapchainSt,
+    pipeline: &PipelineSt,
+) -> Result<(), vk::Result> {
+    for (i, &commandbuffer) in commandbuffers.iter().enumerate() {
+        let commandbuffer_begininfo = vk::CommandBufferBeginInfo::builder();
+        unsafe { logical_device.begin_command_buffer(commandbuffer, &commandbuffer_begininfo)? };
+
+        let clearvalues = [vk::ClearValue {
+            color: vk::ClearColorValue {
+                float32: [0.0, 0.0, 0.08, 1.0],
+            },
+        }];
+        let renderpass_begininfo = vk::RenderPassBeginInfo::builder()
+            .render_pass(*renderpass)
+            .framebuffer(swapchain.framebuffers[i])
+            .render_area(vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent: swapchain.extent,
+            })
+            .clear_values(&clearvalues);
+
+        unsafe {
+            logical_device.cmd_begin_render_pass(
+                commandbuffer,
+                &renderpass_begininfo,
+                vk::SubpassContents::INLINE,
+            );
+
+            logical_device.cmd_bind_pipeline(
+                commandbuffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                pipeline.pipeline,
+            );
+            logical_device.cmd_draw(commandbuffer, 1, 1, 0, 0);
+            logical_device.cmd_end_render_pass(commandbuffer);
+            logical_device.end_command_buffer(commandbuffer)?;
+        }
+    }
+    Ok(())
+}
+
+impl VulkanSt {
+    fn init(window: winit::window::Window) -> Result<VulkanSt, Box<dyn std::error::Error>> {
+        // Loads the Vulkan library and unwraps the result((?))-, erroring if it fails and ending the program
+        let entry = unsafe { ash::Entry::load()? };
+
+        let layer_names = vec![CString::new("VK_LAYER_KHRONOS_validation").unwrap()];
+        let instance = init_instance(&entry, &layer_names)?;
+        let debug = DebugSt::init(&entry, &instance)?;
+
+        // Create our window surface and surface loader (an entry to surface-related functions)
+        let surfaces = SurfaceSt::init(&window, &entry, &instance)?;
+
+        let (physical_device, physical_device_properties) =
+            init_physical_device_and_properties(&instance)?;
+
+        let queue_families = QueueFamilies::init(&instance, physical_device, &surfaces)?;
+
+        let (logical_device, queues) =
+            init_device_and_queues(&instance, physical_device, &queue_families, &layer_names)?;
+
+        let mut swapchain = SwapchainSt::init(
+            &instance,
+            physical_device,
+            &logical_device,
+            &surfaces,
+            &queue_families,
+            &queues,
+        )?;
+
+        let renderpass = init_renderpass(
+            &logical_device,
+            physical_device,
+            swapchain.surface_format.format,
+        )?;
+        swapchain.create_framebuffers(&logical_device, renderpass)?;
+
+        let pipeline = PipelineSt::init(&logical_device, &swapchain, &renderpass)?;
+
+        let pools = PoolsSt::init(&logical_device, &queue_families)?;
+
+        let commandbuffers =
+            create_commandbuffers(&logical_device, &pools, swapchain.framebuffers.len())?;
+
+        fill_commandbuffers(
+            &commandbuffers,
+            &logical_device,
+            &renderpass,
+            &swapchain,
+            &pipeline,
+        )?;
+
+        Ok(VulkanSt {
+            window,
+            entry,
+            instance,
+            debug: ManuallyDrop::new(debug),
+            surfaces: ManuallyDrop::new(surfaces),
+            physical_device,
+            physical_device_properties,
+            queue_families,
+            queues,
+            device: logical_device,
+            swapchain,
+            renderpass,
+            pipeline,
+            pools,
+            commandbuffers,
+        })
+    }
+}
+
+// TODO: Get rid of all the ManuallyDrop::drop garbage
+impl Drop for VulkanSt {
+    fn drop(&mut self) {
+        unsafe {
+            self.pools.cleanup(&self.device);
+            self.pipeline.cleanup(&self.device);
+            self.device.destroy_render_pass(self.renderpass, None);
+            self.swapchain.cleanup(&self.device);
+            self.device.destroy_device(None);
+            std::mem::ManuallyDrop::drop(&mut self.surfaces);
+            std::mem::ManuallyDrop::drop(&mut self.debug);
+            self.instance.destroy_instance(None);
+        };
+    }
+}
 // Validation layers will put their messages here. 'extern' function callback to some external C code
 unsafe extern "system" fn vulkan_debug_utils_callback(
     message_severity: vk::DebugUtilsMessageSeverityFlagsEXT,
     message_type: vk::DebugUtilsMessageTypeFlagsEXT,
-    p_callback_data: *const vk::DebugUtilsMessengerCallbackDataEXT, // Returns a raw pointer to the debug message which is why we deref here
+    p_callback_data: *const vk::DebugUtilsMessengerCallbackDataEXT, // Returns a raw pointer to debug message, needs deref
     _p_user_data: *mut c_void, // Pointer of an unspecified type, we don't use this
 ) -> vk::Bool32 {
     let message = CStr::from_ptr((*p_callback_data).p_message);
