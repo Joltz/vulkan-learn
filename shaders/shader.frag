@@ -2,6 +2,8 @@
 
 layout (location=0) out vec4 theColour;
 
+layout (location=0) in vec4 data_from_the_vertexshader;
+
 void main(){
-    theColour= vec4(1.0,0.0,0.0,1.0);
+	theColour= data_from_the_vertexshader;
 }

@@ -1,11 +1,11 @@
 #version 450
 
-vec4 positions[3] = vec4[](
-    vec4(0.0, -0.5,0.0,1.0),
-    vec4(0.5, 0.5,0.0,1.0),
-    vec4(-0.5, 0.5,0.0,1.0)
-);
+layout (location=0) in vec4 position;
+
+layout (location=0) out vec4 colourdata_for_the_fragmentshader;
 
 void main() {
-    gl_Position = positions[gl_VertexIndex];
+    gl_PointSize=10.0;
+    gl_Position = position;
+    colourdata_for_the_fragmentshader=vec4(0.4,1.0,0.5,1.0);
 }
