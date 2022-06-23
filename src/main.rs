@@ -11,10 +11,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let event_loop = winit::event_loop::EventLoop::new();
     let window = winit::window::WindowBuilder::new()
         .with_title("Lyra-Vulkan")
-        .with_inner_size(winit::dpi::LogicalSize::new(1024.0, 1024.0))
+        .with_inner_size(winit::dpi::LogicalSize::new(512.0, 512.0))
         .build(&event_loop)
         .unwrap();
-    let vulkanloader = VulkanSt::init(window)?;
+    let mut lyra = VulkanSt::init(window)?;
     event_loop.run(move |event, _, controlflow| match event {
         Event::WindowEvent {
             event: WindowEvent::CloseRequested,
@@ -24,10 +24,73 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Event::MainEventsCleared => {
             // do work here later
-            vulkanloader.window.request_redraw();
+            lyra.window.request_redraw();
         }
         Event::RedrawRequested(_) => {
-            // render here later
+            // Aquire the next image
+            lyra.swapchain.current_image =
+                (lyra.swapchain.current_image + 1) % lyra.swapchain.amount_of_images as usize;
+
+            let (image_index, _) = unsafe {
+                lyra.swapchain
+                    .swapchain_loader
+                    .acquire_next_image(
+                        lyra.swapchain.swapchain,
+                        std::u64::MAX,
+                        lyra.swapchain.image_available[lyra.swapchain.current_image],
+                        vk::Fence::null(),
+                    )
+                    .expect("Issue with image acquisition")
+            };
+            unsafe {
+                lyra.device
+                    .wait_for_fences(
+                        &[lyra.swapchain.may_begin_drawing[lyra.swapchain.current_image]],
+                        true,
+                        std::u64::MAX,
+                    )
+                    .expect("Fences Waiting")
+            };
+            unsafe {
+                lyra.device
+                    .reset_fences(&[lyra.swapchain.may_begin_drawing[lyra.swapchain.current_image]])
+                    .expect("Resetting Fences")
+            }
+
+            let semaphores_available =
+                [lyra.swapchain.image_available[lyra.swapchain.current_image]];
+            let waiting_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+            let semaphores_finished =
+                [lyra.swapchain.rendering_finished[lyra.swapchain.current_image]];
+            let commandbuffers = [lyra.commandbuffers[image_index as usize]];
+            let submit_info = [vk::SubmitInfo::builder()
+                .wait_semaphores(&semaphores_available)
+                .wait_dst_stage_mask(&waiting_stages)
+                .command_buffers(&commandbuffers)
+                .signal_semaphores(&semaphores_finished)
+                .build()];
+
+            unsafe {
+                lyra.device
+                    .queue_submit(
+                        lyra.queues.graphics_queue,
+                        &submit_info,
+                        lyra.swapchain.may_begin_drawing[lyra.swapchain.current_image],
+                    )
+                    .expect("Queue Submission")
+            }
+            let swapchains = [lyra.swapchain.swapchain];
+            let indices = [image_index];
+            let present_info = vk::PresentInfoKHR::builder()
+                .wait_semaphores(&semaphores_finished)
+                .swapchains(&swapchains)
+                .image_indices(&indices);
+            unsafe {
+                lyra.swapchain
+                    .swapchain_loader
+                    .queue_present(lyra.queues.graphics_queue, &present_info)
+                    .expect("Queue Presentation")
+            };
         }
         _ => {}
     });
@@ -671,7 +734,7 @@ fn fill_commandbuffers(
 
         let clearvalues = [vk::ClearValue {
             color: vk::ClearColorValue {
-                float32: [0.0, 0.0, 0.08, 1.0],
+                float32: [0.1, 0.1, 0.2, 1.0],
             },
         }];
         let renderpass_begininfo = vk::RenderPassBeginInfo::builder()
@@ -778,6 +841,9 @@ impl VulkanSt {
 impl Drop for VulkanSt {
     fn drop(&mut self) {
         unsafe {
+            self.device
+                .device_wait_idle()
+                .expect("Something went wrong while waiting");
             self.pools.cleanup(&self.device);
             self.pipeline.cleanup(&self.device);
             self.device.destroy_render_pass(self.renderpass, None);
